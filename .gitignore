@@ -1,0 +1,20 @@
+# Собранные бинарники
+collector.exe
+bin/
+*.exe
+
+# Логи
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Секреты: ключ API не попадает в репозиторий
+.env
+
+# Прочее
+.coverage
