@@ -12,7 +12,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -84,38 +83,58 @@ func run() error {
 		return fmt.Errorf("писатель не создан: %w", err)
 	}
 
-	var workers sync.WaitGroup
 	var writeGroup sync.WaitGroup
 
-	// stop нужен для задания 3: по сигналу остановки накопленное
-	// дописывается. В этом задании канал закрывается штатно.
+	// stop закрывается по сигналу остановки. Его получают и писатель, и
+	// сбор городов: писатель дописывает накопленное, сборщик перестаёт
+	// начинать новые города.
+	// stop - обычная остановка: новые города не запускаются.
 	stop := make(chan struct{})
+	// force - аварийная остановка: прерываются и запросы, и запись.
+	force := make(chan struct{})
 
 	writeGroup.Add(1)
 	go func() {
 		defer writeGroup.Done()
-		sink.Run(results, stop)
+		sink.Run(results, force)
 	}()
 
-	// Сбор ограничен по числу городов одновременно.
-	semaphore := make(chan struct{}, cfg.Concurrency)
+	// Остановка по сигналу: первый сигнал перестаёт запускать новые
+	// города и даёт дописать накопленное, по истечении времени ожидания
+	// запросы прерываются.
+	signals, stopSignals := signalChannel()
+	defer stopSignals()
 
-	for _, city := range cfg.Cities {
-		workers.Add(1)
+	// requestCtx отменяется только когда ждать больше нечего: до этого
+	// момента текущие запросы дорабатывают.
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
 
-		go func(name string) {
-			defer workers.Done()
+	watcherDone := make(chan struct{})
 
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+	go func() {
+		defer close(watcherDone)
+		watchSignals(signals, stop, force, cancelRequests, cfg.Grace, logger)
+	}()
 
-			collectCity(context.Background(), client, name, results, logger)
-		}(city)
-	}
+	outcome := collect(
+		requestCtx, stop, force, client, cfg.Cities, cfg.Concurrency, results, logger,
+	)
 
-	workers.Wait()
+	// Сигнал мог не прийти: ждать наблюдателя незачем.
+	close(stop)
+	<-watcherDone
+
 	close(results)
 	writeGroup.Wait()
+
+	logger.Info("сбор остановлен",
+		"interrupted", outcome.Interrupted,
+		"completed", len(outcome.Completed),
+		"failed", len(outcome.Failed),
+		"skipped", len(outcome.Skipped),
+		"records", outcome.Records,
+	)
 
 	// Промежуточного буфера нет, поэтому дописывать нечего: проверяется
 	// только, не было ли ошибки при записи пачек.
@@ -140,44 +159,8 @@ func run() error {
 		"cities", len(cfg.Cities),
 		"elapsed_ms", time.Since(started).Milliseconds(),
 		"output", cfg.Output,
+		"grace", cfg.Grace.String(),
 	)
 
 	return nil
-}
-
-// collectCity собирает оба эндпоинта по одному городу и отправляет записи
-// в канал.
-//
-// Ошибка одного города не останавливает сбор остальных: иначе одна
-// опечатка в названии города обнуляла бы весь прогон.
-func collectCity(
-	ctx context.Context,
-	client *owm.Client,
-	city string,
-	results chan<- owm.WeatherRecord,
-	logger *slog.Logger,
-) {
-	cityStarted := time.Now()
-
-	records, err := client.CollectOne(ctx, city)
-	if err != nil {
-		// Частичный результат сохраняется: текущая погода уже получена, и
-		// выбрасывать её из-за недоступного прогноза незачем.
-		logger.Warn("город собран частично", "city", city, "error", err)
-	}
-
-	if len(records) == 0 {
-		logger.Error("город не собран", "city", city)
-		return
-	}
-
-	for _, record := range records {
-		results <- record
-	}
-
-	logger.Info("город собран",
-		"city", city,
-		"records", len(records),
-		"elapsed_ms", time.Since(cityStarted).Milliseconds(),
-	)
 }

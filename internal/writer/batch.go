@@ -107,7 +107,11 @@ func New(sink io.Writer, opts Options) (*Collector, error) {
 	}, nil
 }
 
-// Run читает записи из канала до его закрытия или отмены.
+// Run читает записи из канала до его закрытия.
+//
+// Обычное завершение - закрытие records: сначала дописывается всё,
+// что осталось. Канал force - аварийный выход, он закрывается, когда
+// ждать больше нечего: накопленное дописывается и Run возвращается.
 //
 // Пачка пишется в трёх случаях: набрался размер, сработал таймер, канал
 // закрыт. Таймер нужен для редкого потока: если новые записи приходят
@@ -116,9 +120,9 @@ func New(sink io.Writer, opts Options) (*Collector, error) {
 // Args:
 //
 //	records: канал с записями.
-//	stop: канал отмены; при отмене накопленное дописывается и Run
+//	force: канал аварийной остановки.
 //	    возвращается. Закрытие records тоже останавливает Run.
-func (c *Collector) Run(records <-chan owm.WeatherRecord, stop <-chan struct{}) {
+func (c *Collector) Run(records <-chan owm.WeatherRecord, force <-chan struct{}) {
 	var ticker *time.Ticker
 	var tick <-chan time.Time
 
@@ -141,11 +145,10 @@ func (c *Collector) Run(records <-chan owm.WeatherRecord, stop <-chan struct{}) 
 		case <-tick:
 			c.flush("time")
 
-		case <-stop:
-			// Забираем всё, что уже положили в канал, и только потом
-			// дописываем: при отмене канал и сигнал готовы одновременно,
-			// и select выбирает ветку произвольно. Без этого запись,
-			// которая успела дойти до канала, потерялась бы.
+		case <-force:
+			// Аварийная остановка: забираем всё, что уже положили в
+			// канал, и дописываем. Обычное завершение идёт по закрытию
+			// records и не теряет ничего.
 			c.drain(records)
 			c.flush("close")
 			return

@@ -33,6 +33,9 @@ type Config struct {
 	EnvAPIKey string
 	// Batch - параметры буферизации и пакетной записи.
 	Batch Batch
+	// Grace - сколько ждать дорабатывания текущих городов после сигнала
+	// остановки, прежде чем прервать запросы.
+	Grace time.Duration
 }
 
 // Parse разбирает флаги и переменные окружения.
@@ -59,6 +62,8 @@ func Parse(args []string) (*Config, error) {
 		"запись по таймеру, даже если пачка не набралась; 0 отключает")
 	channelBuffer := flagSet.Int("channel-buffer", DefaultChannelBuffer,
 		"ёмкость канала между сбором и записью")
+	grace := flagSet.Duration("grace", DefaultGrace,
+		"сколько ждать дорабатывания текущих городов после сигнала остановки")
 
 	if err := flagSet.Parse(args); err != nil {
 		return nil, err
@@ -75,6 +80,10 @@ func Parse(args []string) (*Config, error) {
 
 	if *timeout <= 0 {
 		return nil, errors.New("timeout должен быть больше нуля")
+	}
+
+	if *grace <= 0 {
+		return nil, errors.New("grace должен быть больше нуля")
 	}
 
 	apiKey := strings.TrimSpace(os.Getenv(*envKey))
@@ -101,6 +110,7 @@ func Parse(args []string) (*Config, error) {
 		LogFile:     *logFile,
 		EnvAPIKey:   *envKey,
 		Batch:       batch,
+		Grace:       *grace,
 	}, nil
 }
 
