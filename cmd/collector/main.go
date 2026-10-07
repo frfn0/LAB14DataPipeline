@@ -10,9 +10,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,6 +20,7 @@ import (
 
 	"github.com/frfn0/LAB14DataPipeline/internal/config"
 	"github.com/frfn0/LAB14DataPipeline/internal/owm"
+	"github.com/frfn0/LAB14DataPipeline/internal/writer"
 )
 
 func main() {
@@ -49,6 +48,9 @@ func run() error {
 		"concurrency", cfg.Concurrency,
 		"output", cfg.Output,
 		"api_key", config.RedactedKey(cfg.APIKey),
+		"batch_size", cfg.Batch.BatchSize,
+		"flush_interval", cfg.Batch.FlushInterval.String(),
+		"channel_buffer", cfg.Batch.ChannelBuffer,
 	)
 
 	client, err := owm.New(cfg.APIKey, owm.WithHTTPClient(httpClient(cfg.Timeout)))
@@ -68,20 +70,31 @@ func run() error {
 
 	started := time.Now()
 
-	// results - канал готовых записей. Буфер небольшой: задача 2 добавит
-	// управляемый буфер и пакетную запись.
-	results := make(chan owm.WeatherRecord, 16)
+	// results - канал готовых записей. Ёмкость задаётся параметром: буфер
+	// позволяет сбору идти быстрее записи и не блокироваться на файле.
+	results := make(chan owm.WeatherRecord, cfg.Batch.ChannelBuffer)
+
+	// sink накапливает записи и пишет их пачками: одна операция записи на
+	// пачку вместо одной на запись.
+	sink, err := writer.New(file, writer.Options{
+		BatchSize:     cfg.Batch.BatchSize,
+		FlushInterval: cfg.Batch.FlushInterval,
+	})
+	if err != nil {
+		return fmt.Errorf("писатель не создан: %w", err)
+	}
 
 	var workers sync.WaitGroup
 	var writeGroup sync.WaitGroup
 
-	// writer читает записи из канала и пишет их в файл. Отдельная
-	// горутина нужна для того, чтобы запись шла параллельно со сбором.
-	writer := bufio.NewWriterSize(file, 64*1024)
+	// stop нужен для задания 3: по сигналу остановки накопленное
+	// дописывается. В этом задании канал закрывается штатно.
+	stop := make(chan struct{})
+
 	writeGroup.Add(1)
 	go func() {
 		defer writeGroup.Done()
-		writeRecords(results, writer, logger)
+		sink.Run(results, stop)
 	}()
 
 	// Сбор ограничен по числу городов одновременно.
@@ -104,9 +117,24 @@ func run() error {
 	close(results)
 	writeGroup.Wait()
 
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("буфер записи не сброшен: %w", err)
+	// Промежуточного буфера нет, поэтому дописывать нечего: проверяется
+	// только, не было ли ошибки при записи пачек.
+	if err := sink.Err(); err != nil {
+		return fmt.Errorf("%w: %w", writer.ErrWrite, err)
 	}
+
+	stats := sink.Stats()
+
+	logger.Info("запись завершена",
+		"records", stats.Records,
+		"write_ops", stats.WriteOps,
+		"bytes", stats.Bytes,
+		"avg_batch", fmt.Sprintf("%.1f", stats.AvgBatchSize()),
+		"max_batch", stats.MaxBatch,
+		"flush_by_size", stats.BySize,
+		"flush_by_time", stats.ByTime,
+		"flush_on_close", stats.ByClose,
+	)
 
 	logger.Info("сбор завершён",
 		"cities", len(cfg.Cities),
@@ -152,24 +180,4 @@ func collectCity(
 		"records", len(records),
 		"elapsed_ms", time.Since(cityStarted).Milliseconds(),
 	)
-}
-
-// writeRecords пишет записи в буфер по одной на строку.
-func writeRecords(
-	results <-chan owm.WeatherRecord,
-	writer *bufio.Writer,
-	logger *slog.Logger,
-) {
-	encoder := json.NewEncoder(writer)
-	written := 0
-
-	for record := range results {
-		if err := encoder.Encode(record); err != nil {
-			logger.Error("запись не записана", "city", record.City, "error", err)
-			continue
-		}
-		written++
-	}
-
-	logger.Info("записей записано", "count", written)
 }

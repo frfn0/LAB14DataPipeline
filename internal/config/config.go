@@ -31,6 +31,8 @@ type Config struct {
 	// EnvAPIKey - имя переменной с ключом, чтобы не зашивать имя ключа
 	// в нескольких местах.
 	EnvAPIKey string
+	// Batch - параметры буферизации и пакетной записи.
+	Batch Batch
 }
 
 // Parse разбирает флаги и переменные окружения.
@@ -51,6 +53,12 @@ func Parse(args []string) (*Config, error) {
 	logFile := flagSet.String("log", "", "путь к файлу лога")
 	envKey := flagSet.String("env-key", "OWM_API_KEY",
 		"имя переменной окружения с ключом API")
+	batchSize := flagSet.Int("batch-size", DefaultBatchSize,
+		"сколько записей накапливать перед записью; 1 отключает пакетную запись")
+	flushInterval := flagSet.Duration("flush-interval", DefaultFlushInterval,
+		"запись по таймеру, даже если пачка не набралась; 0 отключает")
+	channelBuffer := flagSet.Int("channel-buffer", DefaultChannelBuffer,
+		"ёмкость канала между сбором и записью")
 
 	if err := flagSet.Parse(args); err != nil {
 		return nil, err
@@ -74,6 +82,16 @@ func Parse(args []string) (*Config, error) {
 		return nil, fmt.Errorf("не задана переменная окружения %s с ключом API", *envKey)
 	}
 
+	batch := Batch{
+		BatchSize:     *batchSize,
+		FlushInterval: *flushInterval,
+		ChannelBuffer: *channelBuffer,
+	}
+
+	if err := batch.Validate(); err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Cities:      list,
 		Output:      *output,
@@ -82,6 +100,7 @@ func Parse(args []string) (*Config, error) {
 		APIKey:      apiKey,
 		LogFile:     *logFile,
 		EnvAPIKey:   *envKey,
+		Batch:       batch,
 	}, nil
 }
 
