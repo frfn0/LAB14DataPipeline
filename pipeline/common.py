@@ -73,6 +73,55 @@ WEATHER_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
+# Схема очищенных данных: поля сборщика плюс разобранное время.
+#
+# Время хранится в трёх полях намеренно. observed_utc - момент наблюдения в
+# единой шкале, по нему строится временной ряд. observed_local - местное время
+# города, по нему считаются суточные агрегаты: сутки в городе заканчиваются в
+# полночь по его времени, а не по UTC. local_date - местная дата, готовое для
+# группировки.
+CLEAN_SCHEMA: dict[str, pl.DataType] = {
+    **WEATHER_SCHEMA,
+    "observed_utc": pl.Datetime("us", "UTC"),
+    "observed_local": pl.Datetime("us"),
+    "collected_utc": pl.Datetime("us", "UTC"),
+    "local_date": pl.Date,
+}
+
+# Имя файла с очищенными данными.
+CLEAN_FILE = "weather_clean.json"
+
+
+def clean_out_path() -> Path:
+    """Путь к файлу с очищенными данными."""
+    return INTERIM_DIR / CLEAN_FILE
+
+
+def load_clean(path: Path | None = None) -> pl.DataFrame:
+    """Загружает очищенные данные, созданные заданием 5.
+
+    Args:
+        path: путь к файлу. По умолчанию берётся стандартный результат
+            очистки.
+
+    Returns:
+        Таблица очищенных данных.
+
+    Raises:
+        FileNotFoundError: если результата очистки нет.
+    """
+    target = path or clean_out_path()
+    if not target.exists():
+        raise FileNotFoundError(
+            f"очищенные данные не найдены: {target}. "
+            "Сначала запустите очистку: python -m pipeline.clean_data"
+        )
+
+    check_contract(target, CLEAN_SCHEMA)
+
+    return pl.read_json(target, schema=CLEAN_SCHEMA)
+
+
 def raw_files(directory: Path = RAW_DIR) -> list[Path]:
     """Файлы с собранными данными, отсортированные по имени.
 
@@ -102,22 +151,33 @@ def check_contract(path: Path, schema: dict[str, pl.DataType]) -> None:
     контракта сборщиком прошло бы молча, а данные появились бы в отчёте как
     пропуски. Проверка сравнивает имена полей первой записи со схемой.
 
+    Поддерживаются оба формата: JSON Lines (объект на строку) и JSON-массив,
+    которым Polars пишет обработанные данные.
+
     Args:
         path: файл с данными.
         schema: ожидаемый состав полей.
 
     Raises:
-        ValueError: если в файле лишние или недостающие поля.
+        ValueError: если файл пуст или состав полей не совпадает со схемой.
     """
-    with path.open(encoding="utf-8") as source:
-        for line in source:
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError(f"файл {path.name} пуст")
+
+    if raw[0] == "[":
+        # JSON-массив: запись - элемент списка.
+        records = json.loads(raw)
+        if not records:
+            raise ValueError(f"файл {path.name} пуст")
+        record = records[0]
+    else:
+        # JSON Lines: запись - первый непустой объект в файле.
+        for line in raw.splitlines():
             if not line.strip():
                 continue
-
             record = json.loads(line)
             break
-        else:
-            raise ValueError(f"файл {path.name} пуст")
 
     actual = set(record)
     expected = set(schema)
@@ -133,7 +193,7 @@ def check_contract(path: Path, schema: dict[str, pl.DataType]) -> None:
             details.append(f"лишние поля: {', '.join(unknown)}")
 
         raise ValueError(
-            f"состав полей в {path.name} не совпадает с контрактом сборщика: "
+            f"состав полей в {path.name} не совпадает с контрактом: "
             + "; ".join(details)
         )
 

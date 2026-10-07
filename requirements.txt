@@ -6,3 +6,7 @@ duckdb>=1.0
 # Визуализация: интерактивные графики и PNG для отчёта
 plotly>=5.20
 matplotlib>=3.8
+
+# База часовых поясов. Нужна Polars на Windows: в системе её нет, и разбор
+# времени падал с ZoneInfoNotFoundError.
+tzdata>=2024.1
