@@ -100,8 +100,16 @@ func TestCurrentWeatherMapsFields(t *testing.T) {
 		t.Fatalf("запрос не выполнен: %v", err)
 	}
 
-	if elapsed <= 0 {
-		t.Error("время запроса не измерено")
+	// Время запроса проверяется не на "больше нуля", а на попадание в
+	// данные: тестовый сервер отвечает за микросекунды, и на Windows
+	// длительность такого запроса округляется до нуля. Такая проверка
+	// падала примерно в одном прогоне из двенадцати.
+	if record.RequestMs != elapsed.Milliseconds() {
+		t.Errorf("время запроса не попало в запись: в записи %d мс, измерено %v",
+			record.RequestMs, elapsed)
+	}
+	if elapsed < 0 {
+		t.Errorf("время запроса отрицательно: %v", elapsed)
 	}
 	if record.City != "Москва" || record.Country != "RU" {
 		t.Errorf("город или страна разобраны неверно: %+v", record)
@@ -379,9 +387,11 @@ func TestRecordIsJSONSerialisable(t *testing.T) {
 func TestContextCancellationStopsRequest(t *testing.T) {
 	t.Parallel()
 
-	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(2 * time.Second)
-		_, _ = w.Write([]byte(currentFixture))
+	// Обработчик ждёт отмены запроса, а не фиксированного времени: иначе
+	// он продолжал бы работать после падения теста, и закрытие тестового
+	// сервера зависало бы на всё время сна.
+	client := newTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
