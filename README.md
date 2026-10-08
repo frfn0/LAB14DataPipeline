@@ -22,7 +22,7 @@
 | 7 | Сохранение в Parquet | выполнено |
 | 8 | Анализ через DuckDB (SQL) | выполнено |
 | 9 | Визуализация результатов | выполнено |
-| 10 | Документирование конвейера | не начато |
+| 10 | Документирование конвейера | выполнено |
 
 ## Подготовка окружения
 
@@ -57,6 +57,25 @@ JSON-файл, по одному объекту на строку.
 Казань, Нижний Новгород, Краснодар, Владивосток, Сочи, Якутск. Они
 разнесены по часовым поясам и климату, иначе сравнение средних температур
 объяснялось бы временем суток, а не погодой.
+
+### Флаги сборщика
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `-cities` | десять городов России | города для сбора через запятую |
+| `-out` | `data/raw/weather.jsonl` | путь к файлу с записями |
+| `-concurrency` | `5` | сколько городов обрабатывать одновременно |
+| `-timeout` | `20s` | предельное время одного HTTP-запроса |
+| `-log` | пусто | путь к файлу лога |
+| `-env-key` | `OWM_API_KEY` | имя переменной окружения с ключом API |
+| `-batch-size` | `50` | сколько записей накапливать перед записью; `1` отключает пакетную запись |
+| `-flush-interval` | `250ms` | запись по таймеру; `0` отключает |
+| `-channel-buffer` | `256` | ёмкость канала между сбором и записью |
+| `-grace` | `10s` | сколько ждать дорабатывания городов после сигнала остановки |
+
+Ключ API читается из переменной окружения, имя которой задаётся флагом
+`-env-key`. Это нужно, когда на машине уже есть переменная с таким именем:
+переименовать её в коде или в окружении проще, чем придумывать вторую.
 
 ### Запуск
 
@@ -795,6 +814,227 @@ ruff check pipeline tests
 Фактический вывод: [results/task9_result.txt](results/task9_result.txt),
 лог прогона: [results/task9_output.txt](results/task9_output.txt)
 
+## Задание 10. Документирование конвейера
+
+### Архитектура
+
+Конвейер состоит из семи шагов. Каждый шаг читает результат предыдущего и
+записывает свой, поэтому шаги можно запускать по одному и проверять данные
+между ними.
+
+```mermaid
+flowchart LR
+    API["OpenWeatherMap API<br/>current + forecast"]
+
+    subgraph GO["Сборщик на Go, задания 1-3"]
+        CITIES["config: флаги и список городов"]
+        FETCH["owm: HTTP-клиент, 2 эндпоинта"]
+        STOP["collect: SIGINT и SIGTERM, -grace"]
+        BATCH["writer: канал с буфером<br/>пачка по размеру и таймеру"]
+
+        CITIES --> FETCH
+        FETCH --> STOP
+        STOP --> BATCH
+    end
+
+    RAW["data/raw/weather.jsonl<br/>JSON Lines, 410 строк"]
+
+    subgraph PY["Анализ на Python, задания 4-9"]
+        IMPORT["import_data<br/>задание 4"]
+        CLEAN["clean_data<br/>задание 5"]
+        AGG["aggregate<br/>задание 6"]
+        PQ["to_parquet<br/>задание 7"]
+        SQL["duckdb_query<br/>задание 8"]
+        VIZ["charts<br/>задание 9"]
+    end
+
+    INTERIM["data/interim/weather_clean.json<br/>31 поле, 420 строк"]
+    PARQUET["reports/weather.parquet<br/>zstd, 26.5 КБ"]
+    CHARTS["reports/charts/<br/>4 графика, PNG и HTML"]
+
+    API --> FETCH
+    BATCH --> RAW
+    RAW --> IMPORT
+    IMPORT --> CLEAN
+    CLEAN --> INTERIM
+    INTERIM --> AGG
+    INTERIM --> PQ
+    PQ --> PARQUET
+    PARQUET --> SQL
+    INTERIM --> VIZ
+    VIZ --> CHARTS
+```
+
+Данные на каждом шаге:
+
+| Шаг | Что читает | Что записывает | Строк |
+|-----|-----------|----------------|-------|
+| 1-3 сборщик | OpenWeatherMap API | `data/raw/weather.jsonl` | 410 |
+| 4 импорт | `data/raw/*.jsonl` | — | 820 |
+| 5 очистка | `data/raw/*.jsonl` | `data/interim/weather_clean.json` | 420 |
+| 6 агрегаты | `data/interim/weather_clean.json` | — | 420 |
+| 7 Parquet | `data/interim/weather_clean.json` | `reports/weather.parquet` | 420 |
+| 8 DuckDB | `reports/weather.parquet` | — | 5 |
+| 9 графики | `data/interim/weather_clean.json` | `reports/charts/` | — |
+
+Задание 4 показывает 820 строк, потому что читает оба файла в `data/raw`:
+основной и созданный вторым запуском для демонстрации удаления повторов.
+Задание 5 схлопывает их в 420 уникальных наблюдений.
+
+### Формат данных
+
+Сборщик пишет JSON Lines: один объект на строку, без обрамляющих массивов.
+Так сделано, чтобы дозапись работала без переписывания файла и чтобы
+частично записанный файл оставался читаемым — построчно, до места обрыва.
+
+```json
+{"city":"Владивосток","endpoint":"current","observed_at":"2026-10-08T04:45:18+10:00","temp_c":13.41,"humidity_pct":66}
+{"city":"Владивосток","endpoint":"forecast","observed_at":"2026-10-08T07:00:00+10:00","temp_c":13.46,"humidity_pct":66}
+```
+
+Оба эндпоинта приводятся к одному типу `WeatherRecord` на 27 полей, а после
+очистки добавляются четыре поля времени: `observed_utc`, `observed_local`,
+`collected_utc` и `local_date`. Итого 31 поле.
+
+Время хранится в четырёх полях намеренно: у городов часовые пояса от +03:00
+до +10:00, и один момент наблюдения в городе — это четыре разных значения.
+Временной ряд строится по UTC, суточные агрегаты считаются по местной дате.
+
+### Как запустить всё
+
+Одна команда запускает шаги 4-9 подряд и останавливается на первом, где вышел
+ненулевой код возврата:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_all.ps1
+```
+
+С ключом API добавляется сбор данных — шаги 1-3:
+
+```powershell
+$env:OWM_API_KEY = "<ключ>"
+
+# сбор
+go run ./cmd/collector -log "logs\collector.log"
+
+# анализ и визуализация
+powershell -ExecutionPolicy Bypass -File scripts\run_all.ps1
+```
+
+Полное время работы аналитической части — **5.7 с** вместе с проверками
+качества кода.
+
+По шагам:
+
+```powershell
+$env:OWM_API_KEY = "<ключ>"
+go run ./cmd/collector -log "logs\collector.log"   # задания 1-3
+
+python -m pipeline.import_data                     # задание 4
+python -m pipeline.clean_data                      # задание 5
+python -m pipeline.aggregate                       # задание 6
+python -m pipeline.to_parquet                      # задание 7
+python -m pipeline.duckdb_query                    # задание 8
+python -m pipeline.charts                          # задание 9
+```
+
+Порядок обязателен: Parquet записывается из очищенных данных, а DuckDB и
+графики читают результаты предыдущих шагов.
+
+### Примеры запросов
+
+Запрос из задания 8 — фильтрация, группировка и сортировка:
+
+```sql
+SELECT city AS город, count(*) AS наблюдений,
+       min(temp_c) AS мин, avg(temp_c) AS средняя, max(temp_c) AS макс,
+       sum(snow_mm + rain_mm) AS осадки
+FROM read_parquet('reports/weather.parquet')
+WHERE temp_c < 10 AND (rain_mm > 0 OR snow_mm > 0)
+GROUP BY city
+HAVING count(*) > 0
+ORDER BY мин;
+```
+
+```
+город            наблюдений   мин °C   средняя °C  макс °C  осадки мм
+Якутск                    6    -4.73        -3.58    -2.72       1.64
+Новосибирск              15     2.33         5.41     8.29       6.84
+Екатеринбург              2     7.31         7.55     7.80       0.53
+Санкт-Петербург           6     8.84         9.38     9.92       7.23
+Москва                    2     9.58         9.63     9.69       0.30
+```
+
+Три самых тёплых города:
+
+```sql
+SELECT city, round(avg(temp_c), 2) AS средняя, count(*) AS наблюдений
+FROM read_parquet('reports/weather.parquet')
+GROUP BY city
+ORDER BY средняя DESC
+LIMIT 3;
+```
+
+```
+city        средняя  наблюдений
+Краснодар     16.18           42
+Сочи          15.50           42
+Владивосток   14.85           42
+```
+
+Погода по дням в одном городе:
+
+```sql
+SELECT local_date, count(*) AS наблюдений, round(avg(temp_c), 1) AS средняя
+FROM read_parquet('reports/weather.parquet')
+WHERE city = 'Якутск'
+GROUP BY local_date
+ORDER BY local_date;
+```
+
+```
+local_date   наблюдений  средняя
+2026-10-08            8      -4.2
+2026-10-09            8      -2.6
+2026-10-10            8      -1.3
+2026-10-11            8      -1.8
+2026-10-12            8      -4.1
+2026-10-13            2      -8.9
+```
+
+Запрос выполняется так:
+
+```python
+import duckdb
+
+result = duckdb.sql("""
+    SELECT city, round(avg(temp_c), 2) AS средняя
+    FROM read_parquet('reports/weather.parquet')
+    GROUP BY city ORDER BY средняя DESC LIMIT 3
+""").pl()
+```
+
+### Примеры графиков
+
+| График | Что показывает |
+|--------|----------------|
+| [01_temperature_timeseries.png](reports/charts/01_temperature_timeseries.png) | Временной ряд температуры по шести городам за пять суток |
+| [02_temperature_histogram.png](reports/charts/02_temperature_histogram.png) | Распределение температуры по 420 наблюдениям |
+| [03_temperature_heatmap.png](reports/charts/03_temperature_heatmap.png) | Тепловая карта «город × местная дата» |
+| [04_precipitation.png](reports/charts/04_precipitation.png) | Сумма осадков по городам, дождь и снег раздельно |
+
+Интерактивные версии лежат рядом с теми же именами и расширением `.html`.
+
+### Проверки качества кода
+
+```bash
+go build ./... && go vet ./... && gofmt -l . && go test ./...
+python -m ruff check pipeline tests && python -m ruff format --check pipeline tests
+python -m pytest
+```
+
+Фактический вывод: [results/task10_result.txt](results/task10_result.txt)
+
 ## Структура проекта
 
 ```
@@ -814,6 +1054,8 @@ ruff check pipeline tests
 ├── reports/                    Parquet для DuckDB
 │   ├── weather.parquet          задание 7: очищенные данные
 │   └── charts/                  задание 9: графики, PNG и HTML
+├── scripts/                    скрипты запуска
+│   └── run_all.ps1             задания 4-9 подряд, с проверками кода
 ├── logs/                       логи сборщика
 ├── results/                    фактический вывод запусков
 ├── pipeline/                   Python: импорт, очистка, анализ, визуализация
@@ -825,7 +1067,14 @@ ruff check pipeline tests
 │   ├── duckdb_query.py         задание 8: анализ через DuckDB
 │   ├── charts.py               задание 9: визуализация
 │   └── report.py               печать таблиц отчёта
-├── tests/                      тесты загрузки и схемы
+├── tests/                      тесты: загрузка, очистка, анализ, документация
+│   ├── test_common.py           загрузка и схема
+│   ├── test_clean.py            шаги очистки
+│   ├── test_aggregate.py        агрегаты
+│   ├── test_parquet.py          запись в Parquet и чтение обратно
+│   ├── test_duckdb.py           SQL и сравнение с Polars
+│   ├── test_charts.py           подготовка данных к графикам
+│   └── test_documentation.py    README, PROMPT_LOG и скрипт запуска
 ├── pytest.ini
 └── requirements.txt
 ```
