@@ -152,7 +152,9 @@ def cities_for_series(frame: pl.DataFrame) -> list[str]:
     «Москва, Тёплый, Тёплый», и город рисовался бы двумя разами.
     """
     means = (
-        frame.group_by("city").agg(pl.col("temp_c").mean().alias("mean")).sort("mean")
+        frame.group_by("city")
+        .agg(pl.col("temp_c").mean().alias("mean"))
+        .sort(["mean", "city"])
     )
     names = means["city"].to_list()
 
@@ -444,6 +446,10 @@ def precipitation(frame: pl.DataFrame, target: Path) -> tuple[list[Path], pl.Dat
     Returns:
         Пара: список файлов и таблица осадков.
     """
+    # Второй ключ сортировки обязателен: у Краснодара и Сочи осадков нет, оба
+    # дают 0.00 мм, и при равных значениях Polars возвращает города в порядке
+    # завершения потоков. Порядок менялся от запуска к запуску, и на графике
+    # местами менялись подписи под двумя последними столбцами.
     table = (
         frame.group_by("city")
         .agg(
@@ -452,7 +458,7 @@ def precipitation(frame: pl.DataFrame, target: Path) -> tuple[list[Path], pl.Dat
             pl.len().alias("наблюдений"),
         )
         .with_columns((pl.col("дождь") + pl.col("снег")).alias("всего"))
-        .sort("всего", descending=True)
+        .sort(["всего", "city"], descending=[True, False])
     )
 
     cities = table["city"].to_list()
@@ -502,7 +508,7 @@ def precipitation(frame: pl.DataFrame, target: Path) -> tuple[list[Path], pl.Dat
     png = save_png(figure, "04_precipitation.png")
 
     interactive = px.bar(
-        table.sort("всего"),
+        table.sort(["всего", "city"]),
         x="city",
         y=["дождь", "снег"],
         title="Сумма осадков по городам за период наблюдений",

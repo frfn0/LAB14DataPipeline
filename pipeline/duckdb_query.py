@@ -140,7 +140,7 @@ def read_polars(table: pl.DataFrame) -> pl.DataFrame:
             pl.col("temp_c").max().alias("макс"),
             (pl.col("snow_mm") + pl.col("rain_mm")).sum().alias("осадки"),
         )
-        .sort("мин")
+        .sort(["мин", "city"])
     )
 
 

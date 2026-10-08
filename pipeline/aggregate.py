@@ -104,7 +104,14 @@ def city_table(frame: pl.DataFrame) -> pl.DataFrame:
         for _, name, field, agg, _ in CITY_COLUMNS
     ]
 
-    return frame.group_by("city").agg(aggregations).sort("temp_avg", descending=True)
+    # Второй ключ: без него порядок городов с одинаковой средней
+    # меняется от запуска к запуску - Polars не гарантирует порядок
+    # строк при равных значениях.
+    return (
+        frame.group_by("city")
+        .agg(aggregations)
+        .sort(["temp_avg", "city"], descending=[True, False])
+    )
 
 
 def print_city_report(frame: pl.DataFrame) -> None:
@@ -185,8 +192,13 @@ def print_daily_report(frame: pl.DataFrame, cities: int = DAILY_CITIES) -> None:
 
     print_table(rows)
 
-    warmest_day = table.sort("temp_mean", descending=True).row(0, named=True)
-    coldest_day = table.sort("temp_mean").row(0, named=True)
+    # Город и дата добавлены вторыми ключами: у первого по теплу
+    # город-дня набор одинаковых средних вполне возможен, а брать
+    # «просто первую строку» значит брать случайную.
+    warmest_day = table.sort(
+        ["temp_mean", "city", "local_date"], descending=[True, False, False]
+    ).row(0, named=True)
+    coldest_day = table.sort(["temp_mean", "city", "local_date"]).row(0, named=True)
 
     print(f"  строк по всем городам: {table.height}")
     print(f"  показаны {cities} первых города по алфавиту")
@@ -219,8 +231,10 @@ def conditions_table(frame: pl.DataFrame) -> pl.DataFrame:
         pl.col("pop_prob").mean().alias("pop_mean"),
     )
 
+    # Тип погоды вторым ключом: число наблюдений у типов может совпасть,
+    # а порядок строк при равенстве не определён.
     return table.with_columns((pl.col("count") / total).alias("share")).sort(
-        "count", descending=True
+        ["count", "weather_main"], descending=[True, False]
     )
 
 
@@ -260,7 +274,7 @@ def endpoint_table(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("wind_speed_ms").mean().alias("wind_mean"),
             pl.col("pop_prob").mean().alias("pop_mean"),
         )
-        .sort("count", descending=True)
+        .sort(["count", "endpoint"], descending=[True, False])
     )
 
 
